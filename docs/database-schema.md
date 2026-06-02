@@ -326,7 +326,7 @@ Contests the outcome of a prior `review_case`.
 
 ---
 
-## Versioning: snapshots vs. deltas
+## Snapshots vs. deltas
 
 `guide_revisions` and `guide_variant_revisions` store a **full snapshot** of the content per revision. The intended uses are view history, see what changed, and roll back to a previous version, which all work directly off snapshots:
 
