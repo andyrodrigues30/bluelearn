@@ -23,10 +23,19 @@ The schema deliberately keeps the database source of truth small:
 - `updated_at`: last update time, maintained by a trigger.
 - `display_name`: optional human-facing name, separate from the unique `username` handle.
 - `bio`: optional short profile text.
-- `role`: governance role. Role enum `learner | maintainer | admin`.
-- `is_suspended`: optional flag for moderation actions against a member, kept separate from `role` so a role is not silently lost.
+- `is_suspended`: optional flag for moderation actions against a member, kept separate from roles so a role is not silently lost on suspension.
 
-See [Roles and Permissions](#roles-and-permissions) for what each role can do. 
+Roles are not a column on `profiles`. Every user is a `learner` implicitly; granted roles (`verifier`, `moderator`, `admin`) live in `user_roles`.
+
+### `user_roles`
+
+The roles a user holds. A user may hold several at once (e.g. both `verifier` and `moderator`). `learner` is the implicit baseline and is not stored here; absence of any row means learner-only.
+
+- `user_id`: FK to `profiles.id`.
+- `role`: granted role enum `verifier | moderator | admin`.
+- `granted_at`: when the role was granted.
+
+For now, roles are granted directly by an admin inserting the `user_roles` row. A self-service application flow is deferred for later; see [Role applications](#role-applications) under Not Yet Implemented.
 
 ### `guides`
 
@@ -56,7 +65,7 @@ Methods, alternatives, and the guide's original write-up all live here as **vari
 - `parent_guide_id`: the parent guide this variant lives under.
 - `slug`: stable URL identifier for the variant.
 - `summary`: short description for lists and previews. A guide's list, frontier, and walkthrough preview uses its canonical variant's summary.
-- `current_revision_id`: nullable FK to `guide_variant_revisions`; points at this variant's live `accepted` revision, null before the variant is first published. Creates a variant↔revision pointer cycle, so the FK should be deferrable.
+- `current_revision_id`: nullable FK to `guide_variant_revisions`; points at the revision whose review case was approved (the variant's live content), null before the variant is first published. Creates a variant↔revision pointer cycle, so the FK should be deferrable.
 - `status`: node-level disposition (`draft | published | archived`); same shape as `guides.status`.
 - `author_id`: the variant's original author.
 - `created_at`: row creation time.
@@ -80,11 +89,11 @@ The single content store: immutable, append-only version history for all variant
 Status enum values are:
 
 - `draft` — being written, not yet submitted.
-- `in_review` — submitted; a verifier panel is judging this revision.
-- `accepted` — passed review. Multiple revisions can be `accepted` over a variant's life; the one currently live is whichever `current_revision_id` points at.
-- `rejected` — this revision attempt was returned by the panel. The author iterates with a new revision; the variant stays `draft` (if never published) or keeps serving its current revision (if already published).
+- `submitted` — handed off to review. The review outcome (in review, accepted, or rejected) is **not** stored here; it is derived from the revision's `variant_review_cases` → `review_cases.status` to avoid redundancy and drift.
 
-Note `published` is deliberately **not** a revision value. "Published" describes the variant/guide node, while a revision that cleared review is `accepted`. A revision also never becomes `archived`; archiving happens at the variant or guide level.
+Submitting a revision is the action that creates its `variant_review_cases` row, in the same transaction that sets `status = submitted`. So every `submitted` revision has exactly one case and the derivation always resolves; a `draft` revision has no case.
+
+Note `accepted` is **not** a stored revision value — a revision "reads as accepted" when its review case has `status = approved`. `published` is also deliberately **not** a revision value: "published" describes the variant/guide node. A revision also never becomes `archived`; archiving happens at the variant or guide level.
 
 **Rollback.** Rollback never deletes newer rows. It inserts a new revision that copies an older one's content. Through this, the version history shows that a rollback occurred through the change_summary.
 
@@ -172,9 +181,8 @@ Upvotes and downvotes on variants (the canonical one plus other methods and alte
 
 Key fields:
 
-- `id`: primary key of the vote.
-- `voter_id`: the user who cast the vote.
-- `variant_id`: the variant being voted on (FK to `guide_variants`). A real foreign key, not a polymorphic pointer.
+- `voter_id`: the user who cast the vote. Half of the composite primary key.
+- `variant_id`: the variant being voted on (FK to `guide_variants`). A real foreign key, not a polymorphic pointer. The other half of the composite primary key.
 - `direction`: `up` or `down`.
 - `reason`: required only on downvotes. Enum mirroring the canonical downvote rubric exactly: `unclear`, `factually_wrong`, `missing_step`, `outdated`, `broken_link`, `prereq_gap`, `wrong_level`, `scope_creep` (covers material outside topic). 
 - `note`: optional free-form text.
@@ -182,10 +190,10 @@ Key fields:
 
 Constraints:
 
-- One vote per voter per variant (`unique (voter_id, variant_id)`).
+- One vote per voter per variant, enforced directly by the composite primary key `(voter_id, variant_id)` — no separate surrogate `id` or unique constraint needed.
 - A check that `reason` is present if and only if `direction = 'down'`.
 
-Display rules: public users see upvote/downvote totals only. The rubric breakdown is visible to maintainers only, enforced by row level security. Variant ordering among siblings is **derived** from net votes, not stored as a rank column.
+Display rules: public users see upvote/downvote totals only. The rubric breakdown is visible to moderators only, enforced by row level security. Variant ordering among siblings is **derived** from net votes, not stored as a rank column.
 
 ### `review_cases`, `review_panels`, and `review_decisions`
 
@@ -201,11 +209,11 @@ The item being reviewed.
 - `created_by`: the user who opened the case (author for publish/edit/appeal, filer for dispute).
 - `created_at`: when the case was created.
 - `updated_at`: when the case status was updated. Updated via a trigger.
-- `time_limit`: the maximum time a panel member can take to cast a vote on a case. When the voting window closes with voting spots still empty, the non-voting members are dropped and replaced by other randomly drawn maintainers who will be assigned the same time limit.
+- `time_limit`: the maximum time a panel member can take to cast a vote on a case. When the voting window closes with voting spots still empty, the non-voting members are dropped and replaced by other randomly drawn panelists from the same pool (verifiers or moderators per case type) who will be assigned the same time limit.
 
 `review_panels`:
 
-An odd-numbered random group of maintainers assembled to decide a case.
+An odd-numbered random group of panelists assembled to decide a case, drawn from the pool that matches the case type: **verifiers** for `variant_publish`/`variant_edit`, **moderators** for `re_review`/`dispute`/`appeal`.
 
 - `id`: primary key of the panel.
 - `case_id`: the case this panel decides (FK to `review_cases`). One case may have many panels.
@@ -215,19 +223,19 @@ An odd-numbered random group of maintainers assembled to decide a case.
 
 `panel_members`:
 
-Maintainers seated on a panel. One row per maintainer per panel. Tracks each seat's lifecycle so the time-limit/replacement flow (see `review_cases.time_limit`) is ground truth, not inferred from whether a decision exists.
+Panelists seated on a panel. One row per seat per panel. Tracks each seat's lifecycle so the time-limit/replacement flow (see `review_cases.time_limit`) is ground truth, not inferred from whether a decision exists.
 
 - `id`: primary key of the seat.
 - `panel_id`: the panel this seat belongs to (FK to `review_panels`).
-- `member_id`: the maintainer holding the seat (FK to `profiles.id`). 
+- `member_id`: the panelist (verifier or moderator) holding the seat (FK to `profiles.id`). 
 - `status`: seat lifecycle state (see enum below).
-- `assigned_at`: when the maintainer was drawn onto the panel. The time limit counts from here.
+- `assigned_at`: when the panelist was drawn onto the panel. The time limit counts from here.
 
 Status enum values are:
 
 - `assigned` — seated, vote pending.
 - `recused` — stepped down for conflict of interest (see conduct rules in `overall-system.md`).
-- `replaced` — dropped and swapped for a new maintainer.
+- `replaced` — dropped and swapped for a new panelist.
 - `completed` — cast a decision.
 
 A `replaced` seat does not delete the row; a new `panel_members` row is drawn for the replacement, so the full seat history of a panel stays auditable.
@@ -237,7 +245,7 @@ A `replaced` seat does not delete the row; a new `panel_members` row is drawn fo
 One panel member's individual vote with its written justification.
 
 - `id`: primary key of the decision.
-- `panel_member_id`: the panel seat that cast it (FK to `panel_members`). One decision per seat — a `completed` seat has exactly one decision row. Carries both the panel and the maintainer through the seat, so no separate `panel_id`/`member_id` pair is stored here.
+- `panel_member_id`: the panel seat that cast it (FK to `panel_members`). One decision per seat — a `completed` seat has exactly one decision row. Carries both the panel and the panelist through the seat, so no separate `panel_id`/`member_id` pair is stored here.
 - `decision`: that member's individual choice: `approve` | `reject`.
 - `notes`: written justification for the decision.
 - `created_at`: when the decision was cast.
@@ -269,7 +277,7 @@ Each attaches type-specific data to a `review_cases` row. `case_id` is both prim
 `disputes`:
 
 - `case_id`: PK and FK to `review_cases`.
-- `dispute_type`: `factual` |`maintainer_misconduct` | `governance` | `cross_subject`.
+- `dispute_type`: `factual` |`reviewer_misconduct` | `governance` | `cross_subject`.
 - `target_type`: what the dispute is against, paired with `target_id` (polymorphic, no single FK). Allowed values depend on `dispute_type` (see table below).
 - `target_id`: the id of that target.
 - `claim_text`: the filer's written claim and evidence summary.
@@ -277,12 +285,12 @@ Each attaches type-specific data to a `review_cases` row. `case_id` is both prim
 What each `dispute_type` points at:
 
 
-| `dispute_type`          | `target_type` | Meaning                                                                            |
-| ----------------------- | ------------- | ---------------------------------------------------------------------------------- |
-| `factual`               | `variant`     | A claim in a variant's content is wrong — any variant, canonical or not.           |
-| `cross_subject`         | `guide`       | Two subject communities conflict over one guide (may spin off).                    |
-| `maintainer_misconduct` | `profile`     | A verifier/maintainer acted in bad faith, so it points at the user.                |
-| `governance`            | nullable      | A policy/process objection with no single content target; `target_id` may be null. |
+| `dispute_type`        | `target_type` | Meaning                                                                            |
+| --------------------- | ------------- | ---------------------------------------------------------------------------------- |
+| `factual`             | `variant`     | A claim in a variant's content is wrong — any variant, canonical or not.           |
+| `cross_subject`       | `guide`       | Two subject communities conflict over one guide (may spin off).                    |
+| `reviewer_misconduct` | `profile`     | A verifier or moderator acted in bad faith, so it points at the user.              |
+| `governance`          | nullable      | A policy/process objection with no single content target; `target_id` may be null. |
 
 
 A `cross_subject` dispute may resolve into a spin-off, recorded via `guides.forked_from_guide_id`.
@@ -391,60 +399,13 @@ Most walkthroughs should be generated on demand by picking a target guide and co
 
 Saved or user-curated walkthroughs are intentionally left for a later migration because their sharing, attribution, and dispute model is still open in `docs/open-questions.md`.
 
-## Roles and Permissions
-
-The roles are cumulative: every user is a `learner`, and `maintainer`/`admin` add permissions on top rather than replacing them. 
-
-### `learner` (default, every user)
-
-Responsible for consuming and contributing content and expressing preference through votes (and potentially comments in the future).
-
-- Read published guides, variants, subject views, and walkthroughs.
-- Author new guides, and methods/alternatives under existing guides (enters the maintainer queue).
-- Modify own drafts and submit diff-style edits to canonical guides.
-- Declare prerequisites and TODO prerequisites on own drafts.
-- Upvote (single click) any guide or variant.
-- Downvote, which requires a rubric reason and an optional section pointer.
-- File disputes, standing-gated to prevent spam.
-- Save walkthroughs (later migration).
-
-Cannot publish content, see the per-row vote-rubric breakdown, or sit on panels.
-
-### `maintainer` — pre-publish gate and post-publish review
-
-Combines the verifier and moderator responsibilities from `overall-system.md` into one role: structural review before publish, and continuous vote-based review, re-review, and dispute resolution after publish. Maintainers are not required to be subject experts; the role is about applying consistent rubric-bound structural standards.
-
-Pre-publish:
-
-- Read the review queue (submissions in `in_review`).
-- Sit on odd-numbered random review panels and cast an outcome: publish provisional or return to author.
-- Write a rubric-citing justification per decision, recorded on the public audit log.
-
-Post-publish:
-
-- See the full vote-rubric breakdown at whole-guide and per-section granularity (learners see totals only).
-- Sit on re-review panels when a guide trips a trigger (ratio, rubric-weighted, or section-density path).
-- Apply re-review outcomes: edit, demote to author, route to dispute, or dismiss as brigade.
-- Sit on dispute and appeal panels drawn from the maintainer pool.
-
-Bounded by the conduct rules in `overall-system.md`: rejections must cite a named rubric item; style, ideology, author identity, and personal factual disagreement are out of scope; maintainers do not pick winners among methods/alternatives (votes do). Panels are odd-numbered, conflict-of-interest excluded, and require written justifications. A maintainer must not sit on a panel reviewing a decision they previously made on the same target — enforced at panel-draw time using the audit log, not by the role itself. Overturned decisions degrade standing.
-
-### `admin` — operational
-
-Not part of the `overall-system.md` governance spec; an operational role for running the platform.
-
-- Grant and revoke the `maintainer` role (until automated credentialing exists).
-- Manage `subjects` (create tags, set prerequisite floors).
-- Suspend members (`is_suspended`).
-- Service-role and infrastructure configuration, including governance-threshold tuning.
-
 ## Not Yet Implemented
 
 These are required by `overall-system.md` but intentionally deferred. They are listed here so the gaps are explicit rather than forgotten. None block the first-pass schema.
 
 ### Subject prerequisite floor
 
-`overall-system.md` lets a subject declare a **prerequisite floor** (e.g. "physics floor = arithmetic + algebra") that applies to its tagged subgraph, keeping subject views from spiralling into low-level dependencies. The [Row Level Security](#row-level-security) section already assumes floors are readable, but no table stores them yet.
+`overall-system.md` lets a subject declare a **prerequisite floor** (e.g. "physics floor = arithmetic + algebra") that applies to its tagged subgraph, keeping subject views from spiralling into low-level dependencies. Floors are assumed readable, but no table stores them yet.
 
 Planned shape: a join table, e.g.
 
@@ -466,6 +427,22 @@ Planned shape: a nullable `section_ref` on `votes` holding the header anchor/slu
 
 ### Standing / reputation
 
-`overall-system.md` standing-gates dispute filing "to prevent spam," and degrades a maintainer's standing when their decisions are overturned ("persistent patterns remove the verifier role"). Nothing in the schema currently exposes a member's standing.
+`overall-system.md` standing-gates dispute filing "to prevent spam," and degrades a reviewer's standing when their decisions are overturned ("persistent patterns remove the verifier role"). Nothing in the schema currently exposes a member's standing.
 
 Open question: **derive** it on demand from existing ground truth (contribution history, `review_decisions`, and `appeals` outcomes) or **store** a maintained `standing`/reputation column on `profiles`. Derivation avoids drift but must be cheap enough to evaluate at dispute-file time and panel-draw time; a stored column is faster to gate on but needs its own update path. Resolve before the dispute system ships.
+
+### Role applications
+
+For now, `verifier`/`moderator`/`admin` roles are granted directly by an admin inserting a `user_roles` row. A self-service flow where users **apply** for a role and an admin (later, automated credentialing) reviews the request is deferred.
+
+Potential shape: a `role_applications` table.
+
+- `id`: primary key.
+- `user_id`: FK to `profiles.id` (the applicant).
+- `role`: role applied for, enum `verifier | moderator`. `admin` is never self-applied, as it stays granted directly.
+- `status`: lifecycle state `pending | approved | rejected`.
+- `statement`: optional applicant note / justification.
+- `decided_at`: when the application was approved/rejected. Null while `pending`.
+- `created_at`: when the application was filed.
+
+Approval inserts the matching `user_roles` row. A partial unique index on `(user_id, role) WHERE status = 'pending'` stops a user stacking duplicate open applications for the same role.
